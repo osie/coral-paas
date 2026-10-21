@@ -1,0 +1,503 @@
+# A complete coralctl spec. This IS the desired state: `coralctl hub create -f
+# hub.yaml` converges the cloud onto it and is re-runnable, so committing this
+# file and applying it on change is a gitops loop. Fields marked (default …)
+# may be omitted; the value shown is what you get.
+#
+# Any $ENV reference is resolved from the environment at load, so a credential
+# is referenced here and kept out of git. Use $${NAME} (a named error if unset),
+# $${NAME:-fallback} (a default when unset), or $$${...} for a literal. An inline
+# value with no reference is used exactly as written.
+#
+# Every credential object below also takes `file:`, a credentials file beside
+# this spec (or ~/…, or absolute) instead of environment variables: KEY=VALUE
+# lines, values bare, mode 600, never committed. A file beside the variables in
+# one object is refused. `coralctl use hub.yaml` then makes this spec current,
+# so no command needs -f and nothing needs exporting first.
+
+# --- identity of the hub -----------------------------------------------------
+
+name: eu-east-hub                       # tags every resource; how every verb finds it.
+                                    #   [a-z0-9][a-z0-9-]* — lowercase, digits, dashes.
+cloud: openstack                    # clouds.yaml entry to authenticate with. Give it an
+                                    #   APPLICATION CREDENTIAL owned by the project, not a
+                                    #   person — the hub keeps it for its own cloud controller.
+# cloudsFile: clouds.yaml           # (optional) the clouds.yaml `cloud` is read from, and then the
+                                    #   only one read. Unset: $OS_CLIENT_CONFIG_FILE, then
+                                    #   ./clouds.yaml, ~/.config/openstack/clouds.yaml and
+                                    #   /etc/openstack/clouds.yaml.
+region: eu-east-1
+
+# --- network model: two independent axes -------------------------------------
+
+attach: private                     # private  = the machines live on their own tenant network
+                                    #             behind a router (works on any OpenStack).
+                                    # public   = ports straight on the shared external network.
+exposure: octavia                   # octavia  = an Octavia LB fronts the control plane and the
+                                    #             ingress (private+octavia is the portable pair).
+                                    # metallb  = MetalLB owns a public VIP (needs attach: public).
+                                    # private + metallb is refused.
+
+externalNetwork: public             # the uplink network, by name or id.
+subnetCIDR: 10.44.0.0/24            # (default 10.44.0.0/24) the hub's own subnet under
+                                    #   attach: private. Must not overlap the pod (10.244/16)
+                                    #   or service (10.245/16) ranges — checked on apply.
+nameservers:                        # (default the cloud's) resolvers the subnet hands out.
+  - 1.1.1.1
+  - 8.8.8.8
+
+# Who may reach the two operator-facing doors — SSH (22) and the apiserver
+# (through the balancer). Empty = open to the world. The control-plane join and
+# konnectivity ports are NOT restricted here: the nodes dial them from their own
+# addresses. Re-applying a changed list CONVERGES — old rules are removed, and
+# an emptied list reopens.
+adminCIDRs:
+  - 203.0.113.10/32                 # the operator's egress
+  - 198.51.100.0/24                 # the CI runner range
+
+# --- the machines ------------------------------------------------------------
+
+# The machines are pools. Exactly one is the control plane. With no worker pool its
+# nodes run everything; with one, the controllers are tainted and every platform
+# cluster's control plane, the monitoring stack and Sveltos run on the workers.
+# See "Sizing a hub" in operator-install.md. A day-2 change (a bigger flavor, a
+# newer image, more nodes) is applied per pool.
+pools:
+  - name: control-plane             # unique; the pool's tag, status, and DNS label.
+    role: control-plane             # exactly one pool is this. An odd count of >= 3, for etcd.
+    flavor: b2i.8c-8g
+    count: 3
+    antiAffinity: soft              # (default) or hard. Every pool's machines join the Nova
+                                    #   server group <name>-<pool>. soft spreads them across
+                                    #   hypervisors where Nova can; hard fails a machine's build
+                                    #   rather than put it beside another of its pool. hard needs
+                                    #   count + 1 eligible hypervisors for a rebuild. Nova fixes
+                                    #   the policy when it creates the group; see "Hypervisor
+                                    #   placement" in operator-install.md.
+    # maxPerHost: 2                 # (hard only) how many of the pool's machines one hypervisor
+                                    #   may hold: Nova's max_server_per_host rule, so a pool can
+                                    #   hold more machines than there are hypervisors.
+    # image inherits the spec-level `image` below when omitted; diskGB and volumeType likewise.
+  - name: workers                   # hosts the platform clusters' control planes.
+    role: worker                    # (default) workloads only.
+    flavor: b2i.8c-32g
+    count: 3                        # at least the control-plane replicas, 3, so no two etcd members share one.
+
+# The pre-pools form is still accepted and means the same thing — `nodes: N`
+# with a top-level `flavor`/`image` becomes one control-plane pool of three plus,
+# for N > 3, a worker pool for the rest. Use pools OR these, not both:
+#   nodes: 3
+#   flavor: b2i.8c-8g
+
+image: base-ubuntu-26.04            # the default boot image a pool inherits when it names none.
+diskGB: 60                          # (default the flavor's) the default root disk a pool inherits.
+volumeType: ssd-fast                # (default the cloud's) the Cinder type of those root disks. A
+                                    #   controller keeps etcd on its own, so name a type whose
+                                    #   volumes pass etcd's fio benchmark (fsync p99 under 10ms);
+                                    #   needs diskGB. Machines built after a change take it.
+sshKey: eu-east.key                 # (default <name>.key beside this file, generated once) the
+                                    #   private key the machines admit. Path resolves against
+                                    #   this spec.
+
+# --- identity / the token service --------------------------------------------
+
+# The cluster's TLS authority — a cluster-wide cert-manager ClusterIssuer that
+# the token service, the API facade and anything else issued on this hub use.
+certificates:                       # exactly one issuer object, and that object selects the issuer:
+                                    #   acme, privateCA: {} or existing: {}. Each issuer's settings
+                                    #   sit under its own object and nowhere else.
+  acme:                             # gives a chain outside clients already trust, from the authority
+                                    #   below, on the same account as the databases.
+    email: ops@example.com          # the ACME account email.
+    # directoryURL: https://dv.acme-v02.api.pki.goog/directory
+                                    # (default Let's Encrypt production) the ACME directory the hub's
+                                    #   own names and every published database are ordered from.
+    # externalAccountBinding:       # declare it, even as {}, for an authority that requires a
+                                    #   binding. Names ENVIRONMENT VARIABLES, never the binding:
+                                    #   create and upgrade write coral-credentials/coral-acme-eab
+                                    #   from them. ONE binding: the hub's issuer and the databases
+                                    #   register one account with it. Once that account exists the
+                                    #   variables may be left unset and the Secret already there is
+                                    #   kept; with no account and no binding the verb refuses.
+    #   kidEnv: CORAL_ACME_EAB_KID           # (default CORAL_ACME_EAB_KID) the key id.
+    #   hmacKeyEnv: CORAL_ACME_EAB_HMAC_KEY  # (default CORAL_ACME_EAB_HMAC_KEY) the base64url HMAC key.
+    #   file: credentials/acme-eab           # or a credentials file of kid= and hmacKey= lines,
+                                    #   in place of the two above. Always read: a file the binding
+                                    #   is not in is refused, spent or not.
+    # trustedRootSecret: acme-root  # a Secret in coral-credentials carrying the authority's own root
+                                    #   as ca.crt, for an authority the public trust store lacks.
+  # privateCA: {}                   # issue from a CA the platform creates.
+  # existing: {}                    # issue from ClusterIssuers already on the cluster.
+
+identity:
+  clusterAccess: client-cert        # (default oidc) how tenants authenticate to their clusters,
+                                    #   for an order that names no access mode. The order records
+                                    #   it, so changing this later leaves that cluster as built.
+  clusterAccessModes: [client-cert, oidc]
+                                    #   (optional) the modes an order may name in its `access`
+                                    #   field; must include clusterAccess. Empty offers
+                                    #   clusterAccess alone. The catalogue publishes the list on
+                                    #   the kubernetes app as `kubernetes.access`.
+  allowedLoginIssuerPrefix: https://osie.example.com/realms/
+                                    #   (optional) every realm issuer OSIE asserts with an order
+                                    #   must start with it; the issuer itself is stamped per cluster.
+  externalServiceID: svc-eu-east    #   (optional) the id this Coral is registered under in OSIE IAM,
+                                    #   and the scope segment of every urn:servicehub: resource a policy
+                                    #   names. Empty reaches wildcard-scoped statements alone.
+  federationObjects: operator       # (default platform) who writes the identity provider `osie`,
+                                    #   the mapping `osie-machine` and the protocol `openid`.
+                                    #   Keystone scopes those calls — the READ included — to a
+                                    #   SYSTEM-scoped admin, which no application credential can
+                                    #   hold. Say `operator` when you made them by hand; `create`
+                                    #   refuses otherwise once the cloud answers the read with 403.
+  projectGroups: operator           # (default platform) who writes the per-project groups and the
+                                    #   member grant. `operator` when your own tooling onboards
+                                    #   projects; this hub then neither writes nor verifies them.
+
+# --- DNS: where the platform writes its records ------------------------------
+
+dns:
+  providers:                        # the DNS services the platform writes through. A name, record
+                                    #   or ACME challenge goes through the one whose zone is the
+                                    #   longest suffix of it; a zone is declared once.
+    - name: cloud                   # (optional with one provider) how messages and status name it.
+      zones: [example.com]          # the zones it serves, as it knows them, no trailing dot.
+      designate: {}                 # exactly one driver object, designate, cloudflare or route53,
+                                    #   and that object selects the service. Designate writes with
+                                    #   this hub's own cloud credential.
+    - name: public
+      zones: [example.net]          # a route53 zone is a public hosted zone.
+      cloudflare: {}                # its token is read from CORAL_DNS_PUBLIC_TOKEN, never from this
+                                    #   file. Records are unproxied.
+      # cloudflare: {tokenEnv: MY_CLOUDFLARE_TOKEN}   # (optional) another variable to read it from.
+      # cloudflare: {file: credentials/dns-public}    # or a credentials file holding token=.
+      # route53: {}                 # reads CORAL_DNS_<NAME>_ACCESS_KEY_ID and
+                                    #   CORAL_DNS_<NAME>_SECRET_ACCESS_KEY, or the variables
+                                    #   accessKeyIDEnv and secretAccessKeyEnv name, or the
+                                    #   accessKeyID= and secretAccessKey= lines of `file`.
+  names:                            # every name the hub publishes for itself, each stated: none is
+                                    #   derived from another. Each is a zone dns.providers declares
+                                    #   or a name inside one; a zone's apex is allowed.
+    api: paas.eu-east.example.com   # the API facade's host.
+    sts: sts.eu-east.example.com    # the token service's host, bare: its issuer is
+                                    #   https://sts.eu-east.example.com/oidc/clusters/<cluster>.
+    platformClusters: cp.paas.eu-east.example.com   # each platform cluster's apiserver, for
+                                    #   operators: <cluster>.cp.paas.eu-east.example.com.
+                                    #   `hub upgrade` carries a change of any of the three through:
+                                    #   it publishes the new name, re-issues what carries the old,
+                                    #   moves the routes and withdraws the old record.
+  appKinds:                         # a domain per app kind, each a declared zone or inside one.
+                                    #   A kind takes its own entry, then its family's <family>/*;
+                                    #   every app the hub enables needs one or the spec is refused.
+                                    #   Tenants' connection strings carry these names, so an entry
+                                    #   is changed only while no order of its kind exists.
+    kubernetes/*: k8s.eu-east.example.com            # tenant apiservers: <cluster>.k8s.eu-east.example.com
+    database/*: db.example.net                       # every database engine, through Cloudflare...
+    database/postgresql: pg.eu-east.example.com      # ...but PostgreSQL, which has its own:
+                                                     #   <id>.pg…, <id>-N.pg…, <id>-N.private.pg…
+
+# --- the platform the hub installs -------------------------------------------
+
+platform:
+  nodeImage: base-ubuntu-26.04      # the image the platform's OWN clusters are built from, unless
+                                    #   one names its own in platformClusters[].spec.nodeImage.
+  nodeImageBuild: "20260902"        # its build stamp, and Glance's `build` property when several
+                                    #   images share the name.
+  rootVolume:                       # (default: none) the Cinder root volumes node pools may boot
+    minSizeGiB: 20                  #   from; a flavor with no local disk needs one. A pool naming
+    types: [ssd]                    #   no type takes the cloud's default. See docs/root-volumes.md.
+
+chart:
+  version: 0.4.0                    # (default: newest in the registry) the coral chart
+                                    #   version to pin the platform to.
+
+# --- what the hub provisions ------------------------------------------------------
+#
+# Nothing is offered until it is declared here. `coralctl hub catalogue` prints the
+# example catalogue — every engine this build ships, one Kubernetes app, and the
+# instance types each role ships offering — to paste in and edit; `coralctl hub
+# catalogue -f hub.yaml` checks the references between the declarations before a
+# create or an upgrade would. The full shape of all three is docs/apps.md.
+#
+# There are no defaults: an order names each group's instance type, unless its role
+# offers exactly one, and each data-holding group's storage size, at least the
+# smallest volume its engine runs on.
+
+apps:                               # which apps this hub provisions, BY NAME. What an app
+  - name: postgresql                #   is — bounds, exposures, parameters, backup shape, the
+    roles:                          #   instance types each role ships offering and the
+      instances:                    #   smallest volume it runs on — ships with the platform
+        instanceTypes: [db.small, db.large]   # and is the same on every hub. An app whose
+    allowPublicInternet: true       #   roles all take what they ship offering is `- <name>`.
+                                    # (default false) whether an order's allowedCIDRs may admit
+                                    #   every address there is: 0.0.0.0/0, ::/0, or prefixes
+                                    #   covering a family. Refused at load for valkey (no
+                                    #   published endpoint) and kubernetes (no allowlist).
+  - name: mongodb
+    roles:                          # (optional) the roles this hub offers in other types,
+      members:                      #   by role name. instanceTypes (names or globs) replace
+        instanceTypes: [db.small, db.large]   # the shipped list; an engine whose group has
+        storageTypes: [standard, nvme]   #   a floor is never offered a type below it.
+                                    #   storageTypes (default: every type) are the volumes
+                                    #   the role may be cut from. A role left out takes the
+                                    #   types it ships offering: configServers db.aux,
+                                    #   routers db.proxy.
+  - name: kubernetes                # hosted Kubernetes. Only its control plane is sized by an
+    kubernetes:                     #   instance type; a worker pool names an OpenStack flavor.
+      workerFlavors: ["k8s.*"]      # (required) flavor-name globs a worker pool may name and
+                                    #   Karpenter may launch. Every flavor of the cloud matching
+                                    #   one is published in the catalogue with its shape.
+      nodeImages:                   # (default: platform.nodeImage alone, offered as `default`)
+        - {id: ubuntu-26.04, displayName: "Ubuntu 26.04 LTS", name: base-ubuntu-26.04, build: "20260902", default: true}
+        - {id: ubuntu-24.04, displayName: "Ubuntu 24.04 LTS", name: base-ubuntu-24.04, build: "20250122"}
+                                    # the base OSes a tenant picks per node pool, as nodePools[].os.
+                                    #   Each Glance image is resolved by name and build at every
+                                    #   converge, as platform.nodeImage is. The one default is the
+                                    #   region's default image, so it names platform.nodeImage and
+                                    #   its build. Moving an OS's build rolls the pools on it under
+                                    #   each cluster's update policy. See docs/apps.md.
+      storageClasses:               # (default: csi-cinder-sc-delete, the default, and
+        - {name: csi-cinder-sc-delete, reclaimPolicy: Delete, default: true}   # -retain,
+        - {name: csi-cinder-sc-retain, reclaimPolicy: Retain}   # on the cloud's default type)
+        - {name: fast, volumeType: nvme, reclaimPolicy: Delete}
+                                    # the StorageClasses every tenant cluster gets, replacing the
+                                    #   default two, so list them to keep them. volumeType is a
+                                    #   Cinder type the cloud's probe lists (empty: its default
+                                    #   type); reclaimPolicy Delete or Retain; exactly one default.
+                                    #   A name keeps its volumeType and reclaimPolicy for good,
+                                    #   after it is dropped too: add a class under a new name and
+                                    #   drop the old one. A dropped class leaves every cluster;
+                                    #   its volumes stay. See docs/apps.md.
+
+instanceTypes:                      # InstanceType CRs: the shapes a role is offered in, and
+  - name: db.small                  #   nothing else — compute only, apart from storage.
+    spec:                           #   Generic across engines, like RDS classes; which roles
+      resources: {cpu: "1", memory: 2Gi}   #   offer one is under roles above.
+      placement:                    # (default: any cluster, any pool that admits it)
+        matchClusters:
+          - labels: {matchLabels: {example.com/disk: nvme}}
+  - name: db.large
+    spec:
+      resources: {cpu: "4", memory: 8Gi}
+  - name: db.proxy                  # the tiers in front of the data: routers, orchestrators
+    spec:                           #   and MaxScale.
+      resources: {cpu: 500m, memory: 1Gi}
+  - name: db.aux                    # the coordination members: MongoDB config servers and
+    spec:                           #   ClickHouse keepers.
+      resources: {cpu: 500m, memory: 1Gi}
+  - name: k8s.cp.small              # a hosted control plane's size.
+    spec:
+      resources: {cpu: "1", memory: 2Gi}
+
+storageTypes:                       # StorageType CRs: the kinds of volume a database group
+  - name: standard                  #   is cut from, apart from any instance type. A group
+    spec:                           #   names one as topology.<group>.storageType, or gets the
+      storageClassName: csi-cinder-sc-delete   #   default; it never changes once cut.
+      size: {min: 1Gi, max: 2Ti}    # (optional) the sizes a volume of this type may be.
+      allowGrow: true               # (default true) whether a volume may grow after it is made.
+      default: true                 # exactly one type is the default.
+  - name: nvme
+    spec:
+      storageClassName: coral-nvme  # with parameters, Coral renders this StorageClass on every
+      parameters: {type: nvme}      #   platform cluster; parameters.type must be a Cinder volume
+      size: {min: 10Gi, max: 2Ti}   #   type the project sees. Without parameters, name one the
+                                    #   platform clusters have: csi-cinder-sc-delete or -retain.
+
+platformClusters:                   # the clusters tenants' databases and control planes run
+  - name: shared-eu-east-1          #   on; see docs/operator-install.md and docs/platform-clusters.md.
+    spec:
+      appKinds: [database/postgresql, database/mongodb, kubernetes/kubernetes]
+      engine: k0smotron             # (default: the substrate blueprint's defaultEngine, written
+                                    #   once) what the cluster itself is built with; fixed once set.
+      controlPlaneEngines: [k0smotron]  # (default: the workload blueprint's defaultEngine, on a
+                                    #   cluster that takes Kubernetes) the engines whose tenants'
+                                    #   control planes it hosts.
+      pools: [standard]
+      monitoring: {stack: prometheus}
+      nodeImage:                    # (default: platform.nodeImage) the Glance image this cluster's
+        name: base-ubuntu-24.04     #   nodes boot, by name and build: MongoDB 8.x refuses kernels
+        build: "20250122"           #   6.19 and newer. coralctl resolves the pair once per
+                                    #   converge; several images sharing the name that Glance's
+                                    #   `build` property does not narrow to one are refused, each
+                                    #   named. Changing it replaces every machine in the cluster.
+      shape:
+        etcdStorageClass: etcd-fast # (default the hub's default StorageClass) the hub StorageClass
+                                    #   this cluster's etcd members, hosted on the hub, claim their
+                                    #   volumes from; one whose type passes etcd's fio benchmark.
+                                    #   Fixed when the cluster is built.
+        nodePools:                  # (required) the cluster's pools, each naming the Nova flavor
+          - {name: pool-a, flavor: b2i.4c-8g, replicas: 2}   #   its machines are built from.
+          - name: general           # a pool of database members, spread across hypervisors.
+            flavor: b2i.8c-16g
+            replicas: 6
+            spread: true            # (default false) its machines join the Nova server group
+                                    #   <cluster>-<pool>. Turning it on or off replaces every
+                                    #   machine in the pool.
+            antiAffinity: hard      # (default soft, needs spread) soft spreads where Nova can and
+                                    #   can stack machines Cluster API creates together; hard
+                                    #   fails a machine's build rather than break the rule.
+            maxPerHost: 2           # (hard only) Nova's max_server_per_host: 6 machines on 3
+                                    #   hypervisors here. A change of antiAffinity or maxPerHost
+                                    #   rolls the pool onto a new group; see "Hypervisor
+                                    #   placement" in operator-install.md.
+            # rollout: {maxSurge: 0, maxUnavailable: 1}  # (optional) how a roll replaces the
+                                    #   machines, as a cluster's node pool takes it. Unset, a pool at
+                                    #   its autoscaling ceiling removes before it builds and any
+                                    #   other builds first; see "How a pool rolls" in
+                                    #   platform-clusters.md. Changing it replaces no machine.
+          - {name: pool-b, flavor: b2i.4c-8g, replicas: 2, rootVolume: {sizeGiB: 50, type: ssd}}  # (optional) boots
+                                    #   from a Cinder volume rather than the flavor's disk.
+backupRepositories:                 # where database backups go; the S3 key is read from
+  - name: primary                   #   CORAL_BACKUP_<NAME>_ACCESS_KEY_ID / _SECRET_ACCESS_KEY.
+    spec:
+      displayName: Primary
+      endpointURL: https://s3.eu-east-1.example.com
+      bucket: coral-backups
+      default: true                 # the one the platform's apps archive to.
+    # credentials:                  # (optional) where else the key is read from:
+    #   accessKeyIDEnv: MY_KEY_ID   #   other variables, or
+    #   secretAccessKeyEnv: MY_KEY
+    #   file: credentials/backup-primary   # a credentials file of accessKeyID= and
+                                    #   secretAccessKey= lines. Not both.
+databaseBackups:                    # (default: "0 0 2 * * *", 02:00 daily, as every app ships)
+  schedule: "0 0 14 * * *"          #   when every database app this hub enables takes its scheduled
+                                    #   base backup: six cron fields, seconds first, read in UTC.
+                                    #   `hub upgrade` moves every existing database onto a changed
+                                    #   one. A schedule an enabled engine cannot run is refused when
+                                    #   the spec loads: MySQL needs every day and one hour (or `*`).
+  # apps:                           # (optional) one app's own schedule, over the one above.
+  #   mongodb: {schedule: "0 30 14 * * *"}
+
+# --- monitoring --------------------------------------------------------------
+#
+# The hub runs its own Prometheus, Alertmanager and Grafana (coral-baseline-monitoring),
+# and every platform cluster its own Prometheus. See docs/operator-observability.md.
+
+monitoring:
+  alertmanager:                     # (required) Alertmanager's own configuration, written to
+    route:                          #   coral-monitoring/coral-alertmanager. `hub create` and
+      receiver: team                #   `hub upgrade` refuse one whose route reaches no receiver
+      group_by: [alertname, platform_cluster]  # with an integration. Warnings, and anything
+      routes:                       #   no route below takes, go to the team's channel;
+        - receiver: on-call         #   critical alerts page.
+          matchers: ['severity="critical"']
+    receivers:                      # coral-heartbeat and coral-discard are Coral's own names.
+      - name: team
+        slack_configs:
+          - api_url: ${SLACK_WEBHOOK_URL:-https://hooks.slack.com/services/EXAMPLE}  # from this machine's environment
+            channel: '#coral-alerts'
+            send_resolved: true
+      - name: on-call
+        pagerduty_configs:
+          - routing_key: '${PAGERDUTY_ROUTING_KEY:-0123456789abcdef0123456789abcdef}'  # quoted: a key
+                                    #   of digits alone would be read as a number.
+  # A hub nobody is paged for says why, in place of the block above:
+  #   alertmanager:
+  #     none: a lab; nobody is on call for it
+  # Every alert is then discarded, and only `coralctl health` lists it.
+  heartbeat:                       # (required) the dead man's switch, OUTSIDE the hub.
+    url: ${CORAL_HEARTBEAT_URL:-https://hc-ping.com/00000000-0000-0000-0000-000000000000}
+                                    #   The always-firing Watchdog is posted here at least once a
+                                    #   minute, never resolved, so an external check (healthchecks.io,
+                                    #   Dead Man's Snitch, Cronitor) pages when the posts stop:
+                                    #   the hub, its Prometheus or its Alertmanager is down.
+                                    # Coral routes the Watchdog and InfoInhibitor itself. A hub
+                                    #   nothing outside watches says why, in place of url:
+                                    #     none: a lab torn down every night
+                                    #   and the Watchdog is then discarded. A url that reaches the
+                                    #   hub itself (a *.svc name, a name the hub publishes, the
+                                    #   hub's own addresses) is warned about on every converge.
+  # grafanaURL: https://grafana.eu-east.example.com  # (optional) the hub's Grafana as an alert's
+                                    #   reader reaches it. Every alert carries a dashboard_url to the
+                                    #   dashboard of what it names, by id; unset, that link is a path
+                                    #   such as /d/coral-cluster?var-cluster=kube-n4hb2, to open on the
+                                    #   Grafana `coralctl grafana` serves.
+
+# --- operations --------------------------------------------------------------
+
+kubeconfig: eu-east.kubeconfig      # (default <name>.kubeconfig beside this file) where the
+                                    #   admin kubeconfig is written.
+operatorKey: ~/.rc/eu-east.operator-key
+                                    # (default <name>.operator-key beside this file, minted once
+                                    #   by `coralctl hub create`) the key `coralctl
+                                    #   workload-cluster` signs with. The hub holds its other
+                                    #   half in coral-upstream; it reaches the operator routes
+                                    #   and no tenant's. Keep it out of the repository.
+
+backup:                             # etcd snapshot policy for `coralctl hub backup`.
+  repositories:                     # (default one `path` repo named `local`, beside the spec)
+    - name: local                   #   a local directory.
+      path: backups                 #     resolves against this spec.
+      retention: 5                  #     (default 10) archives kept; -1 keeps everything.
+    - name: swift                   #   a Swift container.
+      kind: swift
+      container: coral-hub-backups
+      retention: 30
+    - name: dr                      #   an S3 store. Its key is read when a backup, a listing or
+      kind: s3                      #     a restore uses it, from accessKey and secretKey (env
+      endpoint: https://s3.example.com   #   references, see the header), else CORAL_HUB_S3_ACCESS_KEY
+      bucket: hub-backups           #     and CORAL_HUB_S3_SECRET_KEY, or from the credentials
+      region: eu-central-1          #     file below, which is never beside accessKey/secretKey.
+      credentials:
+        file: credentials/hub-dr    #     accessKeyID= and secretAccessKey= lines.
+  default: [local, swift]           # (default: every repository) which a plain `backup` writes.
+
+controlPlaneBackups:                # etcd snapshots of every control plane this hub hosts.
+  hubID: hub-a                      # (default: the hub's name) the folder every snapshot of this hub is kept under.
+  repository: control-planes        # where they go: a BackupRepository of their own, not the default. Without
+                                    #   it no control plane is backed up, the hub's own archive included, and
+                                    #   CoralControlPlaneBackupsUnconfigured fires for each.
+  platformEvery: 15m                # (default 15m) a platform cluster's; minutes dividing an hour,
+  tenantEvery: 1h                   #   or hours dividing a day. (default 1h) a tenant cluster's.
+  hubEvery: 1h                      # (default 1h) this hub's own k0s archive, into the same repository;
+                                    #   refused on a hub on a cluster you run, whose etcd is that cluster's.
+  keepAll: 48h                      # (default 48h) every snapshot is kept this long,
+  keepDaily: 14d                    #   (default 14d) then the newest of each UTC day, and a
+  keepAtLeast: 3                    #   deleted cluster's for as long. (default 3) never fewer.
+  preChangeTimeout: 30m             # (default 30m) how long an upgrade or a roll waits for a snapshot.
+
+timeZone: Europe/Amsterdam          # (default UTC) the IANA zone the fleet roll window below is read in.
+addons:
+  rollout:                          # how add-on changes, and automatic node-image rolls, reach the fleet.
+    window:                         # (default 01:00 to 05:00 every day) when a fleet roll may start; a
+      startTime: "01:00"            #   tenant's own change applies at once. startTime "00:00" with
+      duration: 4h                  #   duration 24h is any hour.
+
+quotas:                             # what one project may order.
+  clustersPerProject: 5             # (default 5) tenant Kubernetes clusters one project may hold at once;
+                                    #   an order beyond it is refused with 409 naming the ceiling and the count.
+
+manifests:                          # objects of your own the hub carries. create and upgrade --chart apply
+  - path: hub-manifests/            #   them server-side once the platform is up, label each
+                                    #   coral.osie.io/operator-manifest=<name>, and delete what the files no
+                                    #   longer declare. A file, or a directory of *.yaml; resolves against this
+                                    #   spec, ~ expanded; env references resolve as in this spec. Objects in the
+                                    #   hub's own namespaces or API groups, CRDs, webhooks and Coral's
+                                    #   ClusterRoles are refused: docs/operator-install.md, "Objects of your own".
+
+# --- a hub on a cluster you run ----------------------------------------------
+#
+# Instead of building machines, coralctl can install Coral on a Kubernetes
+# cluster you built and run, through its kubeconfig. Add the block below and
+# leave out attach, exposure, pools, nodes, flavor, image, diskGB, volumeType,
+# subnetCIDR, nameservers, adminCIDRs, sshKey, kubeconfig, backup and
+# controlPlaneBackups.hubEvery: each describes machines or an etcd coralctl builds,
+# and each is refused with it. `coralctl hub preflight -f` checks
+# the cluster; docs/operator-install.md, "A hub on a cluster you run", lists what
+# it has to provide.
+#
+# cluster:
+#   existing:
+#     kubeconfig: ~/.kube/eu-east-hub.yaml   # read, never written.
+#     context: eu-east-hub-admin             # (default the kubeconfig's current-context)
+#     clusterID: eu-east-hub                 # (default name) the <id> in the apiserver's
+#                                            #   --service-account-issuer, 8 to 64 characters.
+#     hostedControlPlanes:                   # the Octavia balancer platform workers reach
+#       loadBalancerID: 00000000-0000-0000-0000-000000000001   # their hosted control planes
+#       address: 10.20.0.50                  #   through: its VIP on subnetID,
+#       subnetID: 00000000-0000-0000-0000-000000000002         # the subnet every node is on.
+#     platformNetwork:                       # (default subnetID above, and its network) the
+#       id: 00000000-0000-0000-0000-000000000003               # network the platform's own
+#       subnetID: 00000000-0000-0000-0000-000000000002         # clusters join.
+#     attest:
+#       encryptionAtRest: true               # your statement that Secrets are encrypted in
+#                                            #   etcd; coralctl warns without it and installs.

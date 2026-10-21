@@ -1,0 +1,68 @@
+name: Bug report
+description: coralctl, an install path or a guide does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems go through the repository's
+        Security tab, not here; see SECURITY.md.
+  - type: dropdown
+    id: install
+    attributes:
+      label: How coralctl was installed
+      options:
+        - install.sh
+        - Homebrew
+        - .deb package
+        - .rpm package
+        - downloaded by hand
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux amd64
+        - Linux arm64
+        - macOS Apple silicon
+        - macOS Intel
+        - Windows (WSL2)
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: coralctl version --check
+      description: The whole output.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: cloud
+    attributes:
+      label: OpenStack
+      description: The OpenStack release and distribution the hub runs on, if it matters.
+      placeholder: "OpenStack 2025.1, kolla-ansible"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The command's output. Remove anything you would not want public.
+      render: text
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Support bundle
+      description: |
+        For a problem with a running hub, say whether you can send the archive
+        `coralctl hub support-bundle` writes. It is redacted, but send it to
+        support@osie.io rather than attaching it here.

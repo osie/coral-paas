@@ -1,0 +1,16 @@
+name: Feature request
+description: A platform, an install path or a deployment shape coralctl does not cover
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The cloud, the machine you run coralctl on and what you are trying to do.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: How you work around it now, if you do.

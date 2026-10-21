@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  ORAS_VERSION: 1.3.4
+  NFPM_VERSION: 2.47.0
+  COSIGN_VERSION: v3.1.3
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: sigstore/cosign-installer@v4
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Install oras and nfpm
+        run: |
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" |
+            sudo tar -xz -C /usr/local/bin oras
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" |
+            sudo tar -xz -C /usr/local/bin nfpm
+
+      - name: The tag is a version, and the changelog describes it
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          make tag TAG="$TAG"
+          version="${TAG#v}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} f && /^## \[/ {exit} f && !/^\[[^]]+\]: /' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $version." >&2
+            exit 1
+          fi
+
+      - name: Pull coralctl, checking it was signed by osie/coral's release at this tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make pull TAG="$TAG"
+
+      - name: Every pin names this release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make check-pins TAG="$TAG"
+
+      - name: Package and checksum
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make package sums TAG="$TAG"
+
+      - name: Sign SHA256SUMS
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag "${prerelease[@]}" \
+            dist/coralctl-linux-amd64 dist/coralctl-linux-arm64 dist/coralctl-darwin-amd64 dist/coralctl-darwin-arm64 \
+            dist/*.deb dist/*.rpm dist/install.sh dist/THIRD_PARTY_NOTICES.txt \
+            dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
+
+  smoke:
+    needs: release
+    uses: ./.github/workflows/smoke.yml
+    with:
+      tag: ${{ github.ref_name }}

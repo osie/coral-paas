@@ -1,0 +1,95 @@
+name: Smoke
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release to install, e.g. v0.9.18
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  COSIGN_VERSION: v3.1.3
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  install-script:
+    name: install.sh on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: sigstore/cosign-installer@v4
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Install the release, checking its signature
+        run: |
+          sh install.sh --version "$TAG" --dir "$RUNNER_TEMP/bin" | tee install.log
+          grep -q 'signed by osie/coral-paas' install.log
+      - name: coralctl and the k0sctl and helm it carries run here
+        run: |
+          "$RUNNER_TEMP/bin/coralctl" version --check | tee version.log
+          grep -q "^coralctl ${TAG} " version.log
+
+  homebrew:
+    name: Homebrew on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Put brew on the PATH on Linux
+        if: runner.os == 'Linux'
+        run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - name: Install from the tap
+        run: |
+          brew tap osie/coral-paas https://github.com/osie/coral-paas
+          brew install osie/coral-paas/coralctl
+          brew test osie/coral-paas/coralctl
+      - name: The installed coralctl is this release
+        run: |
+          coralctl version --check | tee version.log
+          grep -q "^coralctl ${TAG} " version.log
+
+  packages:
+    name: ${{ matrix.image }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64, image: "debian:13.7", install: "apt-get install -y ./coralctl_*_amd64.deb" }
+          - { runner: ubuntu-24.04, arch: amd64, image: "ubuntu:24.04", install: "apt-get install -y ./coralctl_*_amd64.deb" }
+          - { runner: ubuntu-24.04, arch: amd64, image: "fedora:44", install: "dnf install -y ./coralctl-*.x86_64.rpm" }
+          - { runner: ubuntu-24.04, arch: amd64, image: "rockylinux/rockylinux:9.8", install: "dnf install -y ./coralctl-*.x86_64.rpm" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, image: "debian:13.7", install: "apt-get install -y ./coralctl_*_arm64.deb" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, image: "rockylinux/rockylinux:9.8", install: "dnf install -y ./coralctl-*.aarch64.rpm" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download the release's packages and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir pkg \
+            --pattern '*.deb' --pattern '*.rpm' --pattern SHA256SUMS
+          cd pkg && sha256sum --ignore-missing -c SHA256SUMS
+      - name: Install it and run coralctl
+        env:
+          IMAGE: ${{ matrix.image }}
+          INSTALL: ${{ matrix.install }}
+        run: |
+          docker run --rm -v "$PWD/pkg:/pkg:ro" -w /pkg "$IMAGE" sh -euc "$INSTALL >/dev/null && coralctl version --check" | tee version.log
+          grep -q "^coralctl ${TAG} " version.log
