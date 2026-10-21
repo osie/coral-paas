@@ -1,25 +1,80 @@
 name: Release
 
 on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The Coral release to publish, e.g. v0.9.18; empty publishes the oldest one not released here yet
+        type: string
+        required: false
   push:
     tags: ["v*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
+  ARTIFACT: ghcr.io/osie/coralctl
   ORAS_VERSION: 1.3.4
   NFPM_VERSION: 2.47.0
   COSIGN_VERSION: v3.1.3
 
 jobs:
+  next:
+    name: find the next release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - name: Install oras
+        run: |
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" |
+            sudo tar -xz -C /usr/local/bin oras
+
+      - name: The oldest coralctl Coral has published and this repository has not
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag=""
+          if [ "$EVENT" = push ]; then
+            tag="$REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif published=$(oras repo tags "$ARTIFACT"); then
+            released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' | sort)
+            versions=$(printf '%s\n' "$published" | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || true; } | sed 's/^/v/' | sort)
+            tag=$(comm -23 <(printf '%s\n' "$versions") <(printf '%s\n' "$released") | { grep . || true; } | sort -V | sed -n 1p)
+          else
+            echo "::warning::$ARTIFACT cannot be listed anonymously; nothing is released until it can"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then echo "publishing $tag"; else echo "every coralctl Coral has published is released here"; fi
+
   release:
+    name: publish ${{ needs.next.outputs.tag }}
+    needs: next
+    if: needs.next.outputs.tag != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
+    env:
+      TAG: ${{ needs.next.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
 
       - uses: sigstore/cosign-installer@v4
         with:
@@ -32,31 +87,26 @@ jobs:
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" |
             sudo tar -xz -C /usr/local/bin nfpm
 
-      - name: The tag is a version, and the changelog describes it
-        env:
-          TAG: ${{ github.ref_name }}
+      - name: Pull coralctl, checking it was signed by Coral's release at this tag, and pin it on main
         run: |
           make tag TAG="$TAG"
-          version="${TAG#v}"
-          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} f && /^## \[/ {exit} f && !/^\[[^]]+\]: /' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error::CHANGELOG.md has no section for $version." >&2
-            exit 1
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git checkout -q "$TAG"
+            make pull TAG="$TAG"
+          else
+            make release-prep TAG="$TAG"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Formula/coralctl.rb examples/hub.yaml CHANGELOG.md
+            git commit -q -m "Release coralctl $TAG"
+            git tag -a "$TAG" -m "coralctl $TAG"
+            git push origin HEAD:main "refs/tags/$TAG"
           fi
 
-      - name: Pull coralctl, checking it was signed by osie/coral's release at this tag
-        env:
-          TAG: ${{ github.ref_name }}
-        run: make pull TAG="$TAG"
-
       - name: Every pin names this release
-        env:
-          TAG: ${{ github.ref_name }}
         run: make check-pins TAG="$TAG"
 
       - name: Package and checksum
-        env:
-          TAG: ${{ github.ref_name }}
         run: make package sums TAG="$TAG"
 
       - name: Sign SHA256SUMS
@@ -64,18 +114,17 @@ jobs:
 
       - name: Publish the GitHub release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           prerelease=()
           case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
-          gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag "${prerelease[@]}" \
+          gh release create "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --verify-tag "${prerelease[@]}" \
             dist/coralctl-linux-amd64 dist/coralctl-linux-arm64 dist/coralctl-darwin-amd64 dist/coralctl-darwin-arm64 \
             dist/*.deb dist/*.rpm dist/install.sh dist/THIRD_PARTY_NOTICES.txt \
             dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
 
   smoke:
-    needs: release
+    needs: [next, release]
     uses: ./.github/workflows/smoke.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.next.outputs.tag }}

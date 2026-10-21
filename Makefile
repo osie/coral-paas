@@ -12,8 +12,8 @@ PLATFORMS := linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 TAG ?=
 VERSION = $(patsubst v%,%,$(TAG))
 
-.PHONY: help ci lint test tag pull formula release-prep check-pins completions package sums \
-	yamllint shellcheck codespell actionlint ruby test-install clean
+.PHONY: help ci lint test tag pull formula changelog release-prep check-pins completions package sums \
+	yamllint shellcheck codespell actionlint ruby test-install test-changelog clean
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -22,7 +22,7 @@ ci: lint test ## Everything CI runs
 
 lint: yamllint shellcheck codespell actionlint ruby ## Every linter
 
-test: test-install ## Every test
+test: test-install test-changelog ## Every test
 
 tag:
 	@[[ "$(TAG)" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$$ ]] || { echo "TAG must be v<major>.<minor>.<patch>, not '$(TAG)'" >&2; exit 1; }
@@ -46,8 +46,10 @@ formula: ## Write Formula/coralctl.rb and examples/hub.yaml from the coralctl in
 	cp dist/hub.example.yaml examples/hub.yaml
 	echo "wrote Formula/coralctl.rb and examples/hub.yaml for $(TAG)"
 
-release-prep: pull formula ## Pull $(TAG) and pin it; then write its CHANGELOG section, commit and tag
-	@grep -q "^## \[$(VERSION)\]" CHANGELOG.md || echo "CHANGELOG.md has no section for $(VERSION) yet"
+changelog: tag ## Add $(TAG)'s section to CHANGELOG.md from the release notes in dist/
+	@scripts/changelog.sh "$(VERSION)" "$$(date -u +%Y-%m-%d)" dist/RELEASE_NOTES.md
+
+release-prep: pull formula changelog ## Pull $(TAG), check its signature, and write the formula, example spec and changelog section that pin it
 
 check-pins: tag ## Formula/coralctl.rb, examples/hub.yaml and CHANGELOG.md name the coralctl in dist/
 	@diff -u Formula/coralctl.rb <(scripts/formula.sh "$(VERSION)" dist) || { echo "Formula/coralctl.rb does not pin $(TAG): run make release-prep TAG=$(TAG)" >&2; exit 1; }
@@ -95,6 +97,9 @@ ruby:
 
 test-install: ## install.sh installs a release, checks its checksum and refuses a bad one
 	@scripts/test-install.sh
+
+test-changelog: ## A release's notes become its changelog section, once, newest first
+	@scripts/test-changelog.sh
 
 clean: ## Remove dist/
 	@rm -rf dist

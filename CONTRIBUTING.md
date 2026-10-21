@@ -6,16 +6,14 @@ have not tested, and corrections to the guides are all welcome.
 ## How this repository is maintained
 
 `coralctl` is built from Coral's source, which is not part of this repository.
-Each Coral release publishes its binaries, and this repository's release
-workflow turns them into a GitHub release here: it checks that the binaries
-were signed by Coral's own release at the same tag, builds the `.deb` and
-`.rpm` packages, and signs the checksums. A tag here always names the Coral
-release of the same version.
+Each Coral release publishes its binaries, and this repository releases them by
+itself. A tag here always names the Coral release of the same version.
 
-The install script, the Homebrew formula, the packaging and the guides live
-here, and pull requests against them are reviewed and merged here as usual.
-`examples/hub.yaml` is copied from the Coral release on each tag, so a fix to
-it goes to Coral and arrives back with the next release.
+The install script, the packaging and the guides live here, and pull requests
+against them are reviewed and merged here as usual. The Homebrew formula,
+`examples/hub.yaml` and each changelog section are written by the release
+workflow from the Coral release, so a fix to one of them goes to Coral and
+arrives back with the next release.
 
 ## Reporting a bug
 
@@ -56,16 +54,21 @@ Some things to keep in mind:
 
 ## Releasing
 
-For maintainers, once Coral has published a release:
+Nobody releases by hand. Every 15 minutes the release workflow looks for a
+`coralctl` Coral has published and this repository has not, oldest first, and:
 
-```sh
-make release-prep TAG=v0.9.18   # pulls it, checks its signature, writes the formula and examples/hub.yaml
-$EDITOR CHANGELOG.md            # a section for 0.9.18
-git commit -s -am "release v0.9.18" && git tag v0.9.18 && git push origin main v0.9.18
-```
+1. pulls it and checks it was signed by Coral's own release workflow at the
+   same tag;
+2. writes the Homebrew formula, `examples/hub.yaml` and the changelog section
+   from Coral's release notes, commits them to `main` and tags the release;
+3. builds the `.deb` and `.rpm` packages, signs `SHA256SUMS` and publishes the
+   release;
+4. installs it with `install.sh`, Homebrew and the packages on every supported
+   platform.
 
-The release workflow publishes the release, then installs it with `install.sh`,
-Homebrew and the packages on every supported platform.
+A failure at any step publishes nothing, and the next run tries again. To
+publish one release now, run the workflow by hand with its tag. Locally,
+`make release-prep TAG=v0.9.18` does the first two steps without committing.
 
 ## Commits and sign-off
 
